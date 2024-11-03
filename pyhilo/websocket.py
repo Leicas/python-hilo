@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 from enum import IntEnum
 import json
 from os import environ
-from typing import TYPE_CHECKING, Any, Callable, Dict
+# ic-dev21: ajout de Literal
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal
 
 from aiohttp import ClientWebSocketResponse, WSMsgType
 from aiohttp.client_exceptions import (
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
 
 DEFAULT_WATCHDOG_TIMEOUT = timedelta(minutes=5)
 
+# ic-dev21: liste des deux connections signalR
+HubTybe = Literal["DeviceHub", "ChallengeHub"]
 
 class SignalRMsgType(IntEnum):
     INVOKE = 0x1
@@ -129,17 +132,57 @@ class WebsocketClient:
     def __init__(self, api: API) -> None:
         """Initialize."""
         self._api = api
-        self._connect_callbacks: list[Callable[..., None]] = []
-        self._disconnect_callbacks: list[Callable[..., None]] = []
-        self._event_callbacks: list[Callable[..., None]] = []
+        self._connect_callbacks: Dict[HubType, list[Callable[..., None]]] = {
+            "DeviceHub": [],
+            "ChallengeHub": []
+        }
+        self._disconnect_callbacks: Dict[HubType, list[Callable[..., None]]] = {
+            "DeviceHub": [],
+            "ChallengeHub": []
+        }
+        self._event_callbacks: Dict[HubType, list[Callable[..., None]]] = {
+            "DeviceHub": [],
+            "ChallengeHub": []
+        }
         self._loop = asyncio.get_running_loop()
-        self._watchdog = Watchdog(self.async_reconnect)
-        self._ready_event: asyncio.Event = asyncio.Event()
-        self._ready: bool = False
+        self._watchdogs: Dict[HubType, Watchdog] = {
+            "DeviceHub": Watchdog(lambda: self.async_reconnect("DeviceHub")),
+            "ChallengeHub": Watchdog(lambda: self.async_reconnect("ChallengeHub"))
+        }
+        self._ready_events: Dict[HubType, asyncio.Event] = {
+            "DeviceHub": asyncio.Event(),
+            "ChallengeHub": asyncio.Event()
+        }
+        self._ready: Dict[HubType, bool] = {
+            "DeviceHub": False,
+            "ChallengeHub": False
+        }
+        self._clients: Dict[HubType, ClientWebSocketResponse | None] = {
+            "DeviceHub": None,
+            "ChallengeHub": None
+        }
         self._queued_tasks: list[asyncio.TimerHandle] = []
 
-        # These will get filled in after initial authentication:
-        self._client: ClientWebSocketResponse | None = None
+#        self._api = api
+#        self._connect_callbacks: list[Callable[..., None]] = []
+#        self._disconnect_callbacks: list[Callable[..., None]] = []
+#        self._event_callbacks: list[Callable[..., None]] = []
+#        self._loop = asyncio.get_running_loop()
+#        self._watchdog = Watchdog(self.async_reconnect)
+#        self._ready_event: asyncio.Event = asyncio.Event()
+#        self._ready: bool = False
+#        self._queued_tasks: list[asyncio.TimerHandle] = []
+#
+#        # These will get filled in after initial authentication:
+#        self._client: ClientWebSocketResponse | None = None
+
+    def _get_hub_url(self, hub: HubType) -> str:
+        """Get the WebSocket URL for a specific hub."""
+        if hub == "DeviceHub":
+            return f"{self._api.base_ws_url}{AUTOMATION_DEVICEHUB_ENDPOINT}"
+        elif hub == "ChallengeHub":
+            return f"{self._api.base_ws_url}{API_CHALLENGE_HUB_ENDPOINT}"
+        raise ValueError(f"Invalid hub type: {hub}")
 
     @property
     def connected(self) -> bool:
@@ -230,12 +273,9 @@ class WebsocketClient:
         for callback in self._event_callbacks:
             schedule_callback(callback, event)
 
-    def add_connect_callback(self, callback: Callable[..., Any]) -> Callable[..., None]:
-        """Add a callback callback to be called after connecting.
-        :param callback: The method to call after connecting
-        :type callback: ``Callable[..., None]``
-        """
-        return self._add_callback(self._connect_callbacks, callback)
+    def add_connect_callback(self, hub: HubType, callback: Callable[..., Any]) -> Callable[..., None]:
+        """Add a callback to be called after connecting to a specific hub."""
+        return self._add_callback(self._connect_callbacks[hub], callback)
 
     def add_disconnect_callback(
         self, callback: Callable[..., Any]
@@ -255,15 +295,16 @@ class WebsocketClient:
         """
         return self._add_callback(self._event_callbacks, callback)
 
-    async def async_connect(self) -> None:
-        """Connect to the websocket server."""
-        if self.connected:
-            LOG.debug("Websocket: async_connect() called but already connected")
+    async def async_connect(self, hub: HubType) -> None:
+        """Connect to a specific hub's websocket server."""
+        if self._clients[hub] is not None and not self._clients[hub].closed:
+            LOG.debug(f"Websocket: async_connect() called but already connected to {hub}")
             return
 
-        LOG.info("Websocket: Connecting to server")
+        LOG.info(f"Websocket: Connecting to {hub} server")
         if self._api.log_traces:
-            LOG.debug(f"[TRACE] Websocket URL: {self._api.full_ws_url}")
+            LOG.debug(f"[TRACE] Websocket URL: {self._get_hub_url(hub)}")
+
         headers = {
             "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
             "Pragma": "no-cache",
@@ -272,16 +313,16 @@ class WebsocketClient:
             "Origin": "http://localhost",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        # NOTE(dvd): for troubleshooting purpose we can pass a mitmproxy as env variable
+
         proxy_env: dict[str, Any] = {}
         if proxy := environ.get("WS_PROXY"):
             proxy_env["proxy"] = proxy
             proxy_env["verify_ssl"] = False
 
         try:
-            self._client = await self._api.session.ws_connect(
+            self._clients[hub] = await self._api.session.ws_connect(
                 URL(
-                    self._api.full_ws_url,
+                    self._get_hub_url(hub), # ic-dev21: remove hardcoding
                     encoded=True,
                 ),
                 heartbeat=55,
@@ -289,17 +330,16 @@ class WebsocketClient:
                 **proxy_env,
             )
         except (ClientError, ServerDisconnectedError, WSServerHandshakeError) as err:
-            LOG.error(f"Unable to connect to WS server {err}")
+            LOG.error(f"Unable to connect to {hub} WS server {err}")
             if hasattr(err, "status") and err.status in (401, 403, 404, 409):
                 raise InvalidCredentialsError("Invalid credentials") from err
-        except Exception as err:
-            LOG.error(f"Unable to connect to WS server {err}")
             raise CannotConnectError(err) from err
 
-        LOG.info("Connected to websocket server")
-        self._watchdog.trigger()
-        for callback in self._connect_callbacks:
+        LOG.info(f"Connected to {hub} websocket server")
+        self._watchdogs[hub].trigger()
+        for callback in self._connect_callbacks[hub]:
             schedule_callback(callback)
+
 
     async def _clean_queue(self) -> None:
         for task in self._queued_tasks:
@@ -317,28 +357,25 @@ class WebsocketClient:
 
         LOG.info("Disconnected from websocket server")
 
-    async def async_listen(self) -> None:
-        """Start listening to the websocket server."""
-        assert self._client
-        LOG.info("Websocket: Listen started.")
-        try:
-            while not self._client.closed:
-                messages = await self._async_receive_json()
-                for msg in messages:
-                    self._parse_message(msg)
-        except ConnectionClosedError as err:
-            LOG.error(f"Websocket: Closed while listening: {err}")
-            LOG.exception(err)
-            pass
-        except InvalidMessageError as err:
-            LOG.warning(f"Websocket: Received invalid json : {err}")
-            pass
-        finally:
-            LOG.info("Websocket: Listen completed; cleaning up")
-            self._watchdog.cancel()
-            await self._clean_queue()
+    async def async_listen(self, hub: HubType) -> None:
+        """Start listening to a specific hub's websocket server."""
+        if not self._clients[hub]:
+            raise NotConnectedError(f"Not connected to {hub}")
 
-            for callback in self._disconnect_callbacks:
+        LOG.info(f"Websocket: Listen started for {hub}.")
+        try:
+            while not self._clients[hub].closed:
+                messages = await self._async_receive_json(hub)
+                for msg in messages:
+                    self._parse_message(msg, hub)
+        except ConnectionClosedError as err:
+            LOG.error(f"Websocket: {hub} closed while listening: {err}")
+        except InvalidMessageError as err:
+            LOG.warning(f"Websocket: Received invalid json from {hub}: {err}")
+        finally:
+            LOG.info(f"Websocket: Listen completed for {hub}; cleaning up")
+            self._watchdogs[hub].cancel()
+            for callback in self._disconnect_callbacks[hub]:
                 schedule_callback(callback)
 
     async def async_reconnect(self) -> None:
