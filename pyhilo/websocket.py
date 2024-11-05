@@ -9,7 +9,7 @@ import json
 from os import environ
 from typing import TYPE_CHECKING, Any, Callable, Dict
 
-from aiohttp import ClientWebSocketResponse, WSMsgType
+from aiohttp import ClientSession, ClientWebSocketResponse, WSMsgType
 from aiohttp.client_exceptions import (
     ClientError,
     ServerDisconnectedError,
@@ -357,22 +357,46 @@ class WebsocketClient:
         await self._async_send_json({"type": SignalRMsgType.PING})
 
     async def async_invoke(
-        self, arg: list, target: str, inv_id: int, inv_type: WSMsgType = WSMsgType.TEXT
+            self,
+            arg: list,
+            target: str,
+            inv_id: int,
+            inv_type: WSMsgType = WSMsgType.TEXT,
+            url: str = None,
+            use_post: bool = False # Optional URL parameter
     ) -> None:
-        if not self._ready:
+        """Sends an asynchronous message over WebSocket."""
+        if not self._ready and url is None:
             LOG.warning(
-                f"Delaying invoke {target} {inv_id} {arg}: Websocket not ready."
+                f"Delaying invoke {target} {inv_id} {arg}: WebSocket not ready."
             )
             try:
                 await asyncio.wait_for(self._ready_event.wait(), timeout=10)
             except asyncio.TimeoutError:
                 return
             self._ready_event.clear()
-        await self._async_send_json(
-            {
-                "arguments": arg,
-                "invocationId": str(inv_id),
-                "target": target,
-                "type": inv_type,
+
+        if url and use_post:
+            LOG.info(f"Sending data to {url} via HTTP POST")
+            LOG.info(f"trying to get token {self._api.ws_token}")
+            headers = {
+                "Authorization": f"Bearer {self._api.ws_token}",
             }
-        )
+            async with ClientSession() as session:
+                async with session.post(url, headers=headers) as response:
+                    if response.status != 200:
+                        LOG.error(f"POST request failed with status {response.status}")
+                    else:
+                        LOG.info("POST request sent successfully.")
+            return  # Exit after sending the POST request
+        else:
+            # Use the existing WebSocket client (`self._client`)
+            await self._async_send_json(
+                {
+                    "arguments": arg,
+                    "invocationId": str(inv_id),
+                    "target": target,
+                    "type": inv_type,
+                }
+            )
+
